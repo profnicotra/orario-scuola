@@ -1,0 +1,74 @@
+
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Timetable Runner</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 1.25rem; max-width: 760px; }
+    label { display: block; font-weight: 600; margin-top: .75rem; }
+    input[type=text], input[type=date], input[type=number] { width: 100%; padding: .5rem; border-radius: 8px; border: 1px solid #ccc; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .actions { margin-top: 1rem; }
+    button { padding: .6rem 1rem; border: none; border-radius: 10px; background: #1f6feb; color: white; font-weight: 600; cursor: pointer; }
+    .hint { color: #555; font-size: .9rem; }
+    .chk { margin-right: .5rem; }
+    .footer { margin-top: 1.5rem; color: #777; font-size: .9rem; }
+    .flash { color: #b00020; margin-bottom: .5rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Generatore Orario – Interfaccia Web</h2>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for cat, msg in messages %}
+          <div class="flash">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form action="{{ url_for('run_job') }}" method="post">
+      <label>DSN Postgres</label>
+      <input type="text" name="dsn" value="{{ default_dsn }}">
+      <div class="hint">es. postgresql://utente:password@localhost:5432/scuola_orari</div>
+
+      <div class="row">
+        <div>
+          <label>Data di inizio</label>
+          <input type="date" name="start" value="{{ default_start }}">
+        </div>
+        <div>
+          <label>Settimane (Mon–Fri)</label>
+          <input type="number" name="weeks" min="1" placeholder="1">
+          <div class="hint">Se impostato, ignora "Giorni".</div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label>Giorni scolastici</label>
+          <input type="number" name="days" min="1" placeholder="">
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <label><input class="chk" type="checkbox" name="use_afternoon"> Includi 14:30 e 15:30</label>
+          <label><input class="chk" type="checkbox" name="write_db"> Scrivi su DB (tabella schedule)</label>
+          <label><input class="chk" type="checkbox" name="clear_range"> Pulisci intervallo date prima</label>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button type="submit">Lancia generazione</button>
+      </div>
+    </form>
+
+    <div class="footer">
+      Assicurati che <code>hybrid_timetable_postgres.py</code> sia nella cartella <em>superiore</em> a questa app
+      e che il DB sia stato inizializzato con <code>school_timetable_schema_seed.sql</code>.
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,45 @@
+
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Risultato</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 1.25rem; }
+    pre { background: #0b1020; color: #c7d2fe; padding: 1rem; border-radius: 10px; overflow-x: auto; }
+    .ok { color: #0a7d2a; font-weight: 700; }
+    .err { color: #b00020; font-weight: 700; }
+    ul { line-height: 1.6; }
+    a { text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Risultato esecuzione</h2>
+    <p>Comando:</p>
+    <pre>{{ args }}</pre>
+
+    <p>Exit code: {% if rc == 0 %}<span class="ok">{{ rc }}</span>{% else %}<span class="err">{{ rc }}</span>{% endif %}</p>
+
+    <h3>STDOUT</h3>
+    <pre>{{ stdout }}</pre>
+    <h3>STDERR</h3>
+    <pre>{{ stderr }}</pre>
+
+    {% if files %}
+      <h3>File generati</h3>
+      <ul>
+        {% for path in files %}
+          <li><a href="{{ url_for('files', subpath=path) }}">{{ path }}</a></li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p>Nessun file trovato in output.</p>
+    {% endif %}
+
+    <p><a href="{{ url_for('index') }}">↩︎ Torna al form</a></p>
+  </div>
+</body>
+</html>
