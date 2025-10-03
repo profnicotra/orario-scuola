@@ -8,7 +8,7 @@ from flask import Flask, render_template, request, redirect, url_for, send_from_
 
 APP_DIR = pathlib.Path(__file__).resolve().parent
 OUTPUTS_DIR = APP_DIR / "outputs"
-SCRIPT_PATH = (APP_DIR.parent / "hybrid_timetable_postgres.py").resolve()  # atteso nella cartella superiore
+SCRIPT_PATH = (APP_DIR.parent / "timetable.py").resolve()  # atteso nella cartella superiore
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = "dev-secret"  # cambia in produzione
