@@ -1,6 +1,8 @@
--- school_timetable_schema_seed.sql (esteso)
+-- school_timetable_schema_seed.sql placeholder will be overwritten below
+-- school_timetable_schema_seed.sql (esteso + capacità per periodi)
 BEGIN;
 DROP TABLE IF EXISTS schedule;
+DROP TABLE IF EXISTS class_date_capacity_periods;
 DROP TABLE IF EXISTS class_day_capacity;
 DROP TABLE IF EXISTS class_stage_periods;
 DROP TABLE IF EXISTS teacher_unavailability_periods;
@@ -91,6 +93,15 @@ CREATE TABLE class_day_capacity (
   PRIMARY KEY (class_id, weekday)
 );
 
+CREATE TABLE class_date_capacity_periods (
+  id BIGSERIAL PRIMARY KEY,
+  class_id TEXT REFERENCES classes(class_id) ON DELETE CASCADE,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  max_hours INT NOT NULL CHECK (max_hours >= 0 AND max_hours <= 8),
+  CHECK (start_date <= end_date)
+);
+
 CREATE TABLE schedule (
   schedule_id BIGSERIAL PRIMARY KEY,
   date DATE NOT NULL,
@@ -150,7 +161,11 @@ INSERT INTO teacher_unavailability_periods (teacher_id,start_date,end_date) VALU
 INSERT INTO class_stage_periods (class_id,start_date,end_date) VALUES
   ('1B','2025-10-10','2025-10-10');
 
-INSERT INTO class_day_capacity (class_id,weekday,max_hours) VALUES
-  ('1B',2,4);
+INSERT INTO class_day_capacity (class_id,weekday,max_hours) VALUES ('1B',2,4);
+
+INSERT INTO class_date_capacity_periods (class_id,start_date,end_date,max_hours) VALUES
+  ('1C','2025-10-13','2025-10-17',3);
+INSERT INTO class_date_capacity_periods (class_id,start_date,end_date,max_hours) VALUES
+  ('1B','2025-10-14','2025-10-14',2);
 
 COMMIT;
