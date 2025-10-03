@@ -18,7 +18,7 @@ def safe_bool(val):
 
 @app.route("/", methods=["GET"])
 def index():
-    default_dsn = os.environ.get("DATABASE_URL", "postgresql://USER:PASS@localhost:5432/scuola_orari")
+    default_dsn = os.environ.get("DATABASE_URL", "postgresql://postgres:Borsa2025!!!@localhost:5432/scuola_orari")
     next_monday = datetime.date.today() + datetime.timedelta(days=((7 - datetime.date.today().weekday()) % 7))
     return render_template("index.html",
                            default_dsn=default_dsn,
