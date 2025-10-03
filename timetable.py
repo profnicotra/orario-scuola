@@ -1,21 +1,43 @@
-# Prototype: hybrid school timetable generator (backtracking), with CSV/ICS export.
-# Notes:
-# - No external libraries beyond standard Python.
-# - Generates a small demo dataset (2 classi, 4 materie, 4 docenti, 1 settimana).
-# - Hybrid blocks: lab subjects use macro blocks (2h). If infeasible, optional fallback to split into 1h units.
-# - Exports schedule.csv + ICS files per classe e per docente.
+# hybrid_timetable_postgres.py
+# Prototype: hybrid school timetable generator with Postgres IO (DDL sample provided separately).
+# - Reads classes/subjects/teachers/groups/plans/availability from Postgres
+# - Builds a hybrid schedule (macro blocks for labs, unit fallback if needed)
+# - Exports CSV + ICS and (optionally) writes schedule back to Postgres
 #
-# Esegui con: python hybrid_timetable_prototype.py
+# Usage examples:
+#   python hybrid_timetable_postgres.py --dsn "postgresql://user:pass@localhost:5432/scuola_orari" --start 2025-10-06 --days 5 --out ./out --write-db --clear-range
+#   python hybrid_timetable_postgres.py --dsn $DATABASE_URL --weeks 1
+#
+# Dependencies:
+#   pip install psycopg[binary]      # preferred (psycopg v3)
+#   # or
+#   pip install psycopg2-binary      # fallback (psycopg2)
 
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Set
 from datetime import date, timedelta, datetime
-import csv
+import argparse
 import os
+import csv
+import sys
+
+# Try psycopg v3 then fallback to psycopg2
+try:
+    import psycopg  # type: ignore
+    HAVE_PSYCOPG3 = True
+except Exception:
+    HAVE_PSYCOPG3 = False
+    try:
+        import psycopg2 as psycopg  # type: ignore
+    except Exception as e:
+        print("Errore: serve 'psycopg[binary]' o 'psycopg2-binary' (pip install).", file=sys.stderr)
+        raise
 
 # -----------------------------
-# Data structures
+# Domain
 # -----------------------------
+
+SLOTS_ALL = ["08:00","09:00","10:00","11:00","12:00","13:00","14:30","15:30"]
 
 @dataclass(frozen=True)
 class Class:
@@ -26,8 +48,8 @@ class Class:
 class Subject:
     subject_id: str
     name: str
-    block_len_min: int = 1          # minimo blocco richiesto
-    macro_preferred: bool = False   # se True, genera macro-lezioni (k=block_len_min)
+    block_len_min: int = 1
+    macro_preferred: bool = False
 
 @dataclass(frozen=True)
 class Teacher:
@@ -38,7 +60,7 @@ class Teacher:
 class MergeGroup:
     merge_id: str
     name: str
-    members: List[str]  # class_id list
+    members: List[str]
 
 @dataclass
 class ClassSubjectPlan:
@@ -49,9 +71,8 @@ class ClassSubjectPlan:
 
 @dataclass
 class Availability:
-    # Disponibilità per docente per giorno della settimana (0=Mon..6=Sun) e per slot label ("08:00",...)
     teacher_id: str
-    weekday: int
+    weekday: int      # 0=Mon..6=Sun
     slot_labels: Set[str]
 
 @dataclass
@@ -61,10 +82,10 @@ class SchoolCalendar:
 @dataclass
 class Lesson:
     lesson_id: str
-    class_or_group_id: str    # "C:<class_id>" o "G:<merge_id>"
+    class_or_group_id: str
     subject_id: str
-    duration_slots: int       # 1 per unità; >=2 per macro
-    split_fallback: bool      # se True e la macro fallisce, spezza in unità da 1h
+    duration_slots: int
+    split_fallback: bool
 
 @dataclass
 class Assignment:
@@ -76,22 +97,18 @@ class Assignment:
     class_or_group_id: str
     subject_id: str
 
-
 # -----------------------------
 # Utilities
 # -----------------------------
 
-SLOTS_ALL = ["08:00","09:00","10:00","11:00","12:00","13:00","14:30","15:30"]
-
 def slots_between(start_label: str, k: int, slots: List[str]) -> Optional[List[str]]:
-    """Ritorna la lista di k slot consecutivi a partire da start_label, altrimenti None."""
     if start_label not in slots:
         return None
     i = slots.index(start_label)
     j = i + k
     if j <= len(slots):
         block = slots[i:j]
-        # Evita attraversare 13:00 -> 14:30 come contiguità
+        # forbid lunch break adjacency 13:00 -> 14:30
         for a, b in zip(block[:-1], block[1:]):
             if a == "13:00" and b == "14:30":
                 return None
@@ -106,7 +123,6 @@ def dt_local(date_obj: date, slot_label: str) -> datetime:
     hh, mm = map(int, slot_label.split(":"))
     return datetime(date_obj.year, date_obj.month, date_obj.day, hh, mm)
 
-
 # -----------------------------
 # Solver (backtracking)
 # -----------------------------
@@ -117,7 +133,7 @@ class TimetableSolver:
         classes: Dict[str, Class],
         subjects: Dict[str, Subject],
         teachers: Dict[str, Teacher],
-        teacher_subjects: Dict[str, Set[str]],  # teacher_id -> set(subject_id)
+        teacher_subjects: Dict[str, Set[str]],
         availability: List[Availability],
         class_plans: List[ClassSubjectPlan],
         merge_groups: Dict[str, MergeGroup],
@@ -136,23 +152,21 @@ class TimetableSolver:
 
         self.slots = [s for s in SLOTS_ALL if (use_afternoon or s <= "13:00")]
 
-        # Build availability map: (teacher, weekday) -> set(slot_labels)
+        # (teacher, weekday) -> set(slot_labels)
         self.avail_map: Dict[Tuple[str,int], Set[str]] = {}
         for av in availability:
             self.avail_map.setdefault((av.teacher_id, av.weekday), set()).update(av.slot_labels)
 
-        # Resource occupancy trackers during search
+        # Resource occupancy during search
         self.teacher_busy: Set[Tuple[str, date, str]] = set()
         self.class_busy: Set[Tuple[str, date, str]] = set()
         self.group_busy: Set[Tuple[str, date, str]] = set()
 
-        # Precompute map from group key to its member classes
-        # Keys per class_or_group_id: "C:<class_id>" or "G:<merge_id>"
+        # Group -> members
         self.group_members: Dict[str, List[str]] = {}
         for gid, g in merge_groups.items():
             self.group_members[f"G:{gid}"] = list(g.members)
 
-        # Diagnostics
         self.initial_zero_domain: List[str] = []
 
     def generate_lessons(self, allow_macro_split_fallback: bool = True) -> List[Lesson]:
@@ -196,11 +210,9 @@ class TimetableSolver:
         return lessons
 
     def candidate_assignments(self, lesson: Lesson) -> List[Tuple[date, str, str]]:
-        """Restituisce [(data, start_slot, teacher_id)] possibili ignorando conflitti con altre lezioni."""
         candidates = []
         subj = self.subjects[lesson.subject_id]
         k = lesson.duration_slots
-        # Docenti abilitati
         teachers_for_subj = [tid for tid, subs in self.teacher_subjects.items() if subj.subject_id in subs]
         if not teachers_for_subj:
             return candidates
@@ -217,7 +229,6 @@ class TimetableSolver:
         return candidates
 
     def order_lessons(self, lessons: List[Lesson], domains: Dict[str, List[Tuple[date,str,str]]]) -> List[Lesson]:
-        # Euristica: blocchi più lunghi prima; poi dominio più piccolo (MRV); gruppi prima delle classi singole
         def key(l: Lesson):
             dom = domains.get(l.lesson_id, [])
             is_group = l.class_or_group_id.startswith("G:")
@@ -229,11 +240,9 @@ class TimetableSolver:
         block = slots_between(start, k, self.slots)
         if not block:
             return True
-        # Docente
         for s in block:
             if (tid, d, s) in self.teacher_busy:
                 return True
-        # Classe/Gruppo
         if lesson.class_or_group_id.startswith("G:"):
             if any((lesson.class_or_group_id, d, s) in self.group_busy for s in block):
                 return True
@@ -277,14 +286,13 @@ class TimetableSolver:
     def search(self, lessons: List[Lesson], domains: Dict[str, List[Tuple[date,str,str]]]) -> Optional[List[Assignment]]:
         if not lessons:
             return []
-
         L = lessons[0]
 
         def candidate_score(c):
             d, start, tid = c
             base = {"08:00": 5, "09:00": 3, "10:00": 1, "11:00": 1, "12:00": 2, "13:00": 3, "14:30": 6, "15:30": 6}.get(start, 4)
             teacher_load = sum(1 for (tt, dd, ss) in self.teacher_busy if tt == tid and dd == d)
-            return (base, teacher_load)  # più basso è meglio
+            return (base, teacher_load)
 
         for (d, start, tid) in sorted(domains[L.lesson_id], key=candidate_score):
             if not self.is_conflict(L, d, start, tid):
@@ -299,10 +307,7 @@ class TimetableSolver:
         return None
 
     def solve(self, allow_macro_split_fallback: bool = True, try_split_on_fail: bool = True):
-        # 1) Build lessons (macro + units)
         lessons = self.generate_lessons(allow_macro_split_fallback=allow_macro_split_fallback)
-
-        # 2) Domains
         domains: Dict[str, List[Tuple[date,str,str]]] = {}
         zero_domain_lessons = []
         for L in lessons:
@@ -311,7 +316,6 @@ class TimetableSolver:
             if not dom:
                 zero_domain_lessons.append(L)
 
-        # 3) Split fallback per le macro senza candidati
         if zero_domain_lessons and try_split_on_fail:
             changed = False
             new_lessons = []
@@ -340,9 +344,8 @@ class TimetableSolver:
 
         self.initial_zero_domain = [L.lesson_id for L in zero_domain_lessons]
         if zero_domain_lessons:
-            return None, {"feasible": False, "reason": "Lezioni senza candidati", "lessons": zero_domain_lessons}
+            return None, {"feasible": False, "reason": "Lezioni senza candidati", "lessons": self.initial_zero_domain}
 
-        # 4) Order + Search
         ordered_lessons = self.order_lessons(lessons, domains)
         solution = self.search(ordered_lessons, domains)
         if solution is None:
@@ -350,10 +353,75 @@ class TimetableSolver:
         solution.sort(key=lambda a: (a.date, a.start_slot, a.class_or_group_id))
         return solution, {"feasible": True, "zero_domain": self.initial_zero_domain}
 
+# -----------------------------
+# Postgres IO
+# -----------------------------
 
-# -----------------------------
-# Export: CSV and ICS
-# -----------------------------
+def connect_pg(dsn: str):
+    if HAVE_PSYCOPG3:
+        return psycopg.connect(dsn)  # psycopg v3
+    return psycopg.connect(dsn)      # psycopg2 signature
+
+def load_config_from_db(conn, start_date: date, days: Optional[int], weeks: Optional[int]):
+    cur = conn.cursor()
+    cur.execute("SELECT class_id, name FROM classes ORDER BY class_id")
+    classes = {r[0]: Class(r[0], r[1]) for r in cur.fetchall()}
+
+    cur.execute("SELECT subject_id, name, COALESCE(block_len_min,1), COALESCE(macro_preferred,false) FROM subjects ORDER BY subject_id")
+    subjects = {r[0]: Subject(r[0], r[1], int(r[2]), bool(r[3])) for r in cur.fetchall()}
+
+    cur.execute("SELECT teacher_id, name FROM teachers ORDER BY teacher_id")
+    teachers = {r[0]: Teacher(r[0], r[1]) for r in cur.fetchall()}
+
+    cur.execute("SELECT teacher_id, subject_id FROM teacher_subjects")
+    teacher_subjects: Dict[str, Set[str]] = {}
+    for tid, sid in cur.fetchall():
+        teacher_subjects.setdefault(tid, set()).add(sid)
+
+    cur.execute("SELECT merge_id, name FROM merge_groups ORDER BY merge_id")
+    merge_groups: Dict[str, MergeGroup] = {}
+    for mid, name in cur.fetchall():
+        merge_groups[mid] = MergeGroup(mid, name, members=[])
+    cur.execute("SELECT merge_id, class_id FROM merge_members")
+    for mid, cid in cur.fetchall():
+        if mid in merge_groups:
+            merge_groups[mid].members.append(cid)
+
+    # availability rows -> aggregate to set per (teacher, weekday)
+    cur.execute("SELECT teacher_id, weekday, slot_label FROM teacher_availability")
+    av_map: Dict[Tuple[str,int], Set[str]] = {}
+    for tid, wd, slot_label in cur.fetchall():
+        av_map.setdefault((tid, int(wd)), set()).add(slot_label)
+    availabilities: List[Availability] = [Availability(tid, wd, slots) for (tid, wd), slots in av_map.items()]
+
+    # holidays
+    cur.execute("SELECT dt FROM holidays")
+    holidays = {r[0] for r in cur.fetchall()}
+
+    # school days: Mon-Fri only, skip holidays
+    school_days: List[date] = []
+    if weeks is not None and weeks > 0:
+        d = start_date
+        while d.weekday() != 0:
+            d += timedelta(days=1)
+        total_days = weeks * 7
+        end = d + timedelta(days=total_days-1)
+        dd = d
+        while dd <= end:
+            if dd.weekday() < 5 and dd not in holidays:
+                school_days.append(dd)
+            dd += timedelta(days=1)
+    elif days is not None and days > 0:
+        dd = start_date
+        while len(school_days) < days:
+            if dd.weekday() < 5 and dd not in holidays:
+                school_days.append(dd)
+            dd += timedelta(days=1)
+    else:
+        raise ValueError("Specificare --days o --weeks.")
+
+    cur.close()
+    return classes, subjects, teachers, teacher_subjects, merge_groups, availabilities, SchoolCalendar(school_days)
 
 def export_csv(schedule: List[Assignment], classes: Dict[str, Class], subjects: Dict[str, Subject], teachers: Dict[str, Teacher], merge_groups: Dict[str, MergeGroup], path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -455,122 +523,103 @@ def export_ics_per_teacher(schedule: List[Assignment], teachers: Dict[str, Teach
                 f.write("END:VEVENT\r\n")
             f.write("END:VCALENDAR\r\n")
 
+def write_schedule_to_db(conn, schedule: List[Assignment], clear_range: bool = False):
+    if not schedule:
+        return
+    dmin = min(a.date for a in schedule)
+    dmax = max(a.date for a in schedule)
+    cur = conn.cursor()
+    if clear_range:
+        cur.execute("DELETE FROM schedule WHERE date BETWEEN %s AND %s", (dmin, dmax))
+    for a in schedule:
+        if a.class_or_group_id.startswith("C:"):
+            class_or_group_type = "C"
+            cid = a.class_or_group_id.split("C:",1)[1]
+            gid = None
+        else:
+            class_or_group_type = "G"
+            gid = a.class_or_group_id.split("G:",1)[1]
+            cid = None
+        cur.execute("""
+            INSERT INTO schedule (date, start_slot, end_slot, class_or_group_type, class_id, merge_id, subject_id, teacher_id)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (a.date, a.start_slot, a.end_slot, class_or_group_type, cid, gid, a.subject_id, a.teacher_id))
+    conn.commit()
+    cur.close()
 
 # -----------------------------
-# DEMO DATASET
+# Main
 # -----------------------------
+
+def _plans_from_db(conn) -> List[ClassSubjectPlan]:
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT plan_id, class_id, merge_id, subject_id, total_hours
+        FROM class_subject_plan
+        ORDER BY plan_id
+    """)
+    plans: List[ClassSubjectPlan] = []
+    for plan_id, class_id, merge_id, subject_id, total_hours in cur.fetchall():
+        if class_id and not merge_id:
+            cid = f"C:{class_id}"
+        elif merge_id and not class_id:
+            cid = f"G:{merge_id}"
+        else:
+            raise ValueError(f"Piano {plan_id}: specificare solo class_id O merge_id.")
+        plans.append(ClassSubjectPlan(str(plan_id), cid, subject_id, int(total_hours)))
+    cur.close()
+    return plans
+
+def main():
+    ap = argparse.ArgumentParser(description="Hybrid School Timetable (Postgres)")
+    ap.add_argument("--dsn", required=True, help="Postgres DSN, es: postgresql://user:pass@localhost:5432/scuola_orari")
+    ap.add_argument("--start", type=lambda s: date.fromisoformat(s), help="Data di inizio (YYYY-MM-DD)")
+    ap.add_argument("--days", type=int, help="Numero di giorni scolastici da generare (Mon-Fri, salta weekend/festivi)")
+    ap.add_argument("--weeks", type=int, help="Numero di settimane Mon-Fri da generare (ignora --days)")
+    ap.add_argument("--out", default="./timetable_output", help="Cartella di output per CSV/ICS")
+    ap.add_argument("--use-afternoon", action="store_true", help="Includi 14:30 e 15:30")
+    ap.add_argument("--write-db", action="store_true", help="Scrivi la soluzione nella tabella schedule")
+    ap.add_argument("--clear-range", action="store_true", help="Cancella righe esistenti in schedule nell'intervallo di date della soluzione")
+    args = ap.parse_args()
+
+    if args.start is None:
+        today = date.today()
+        args.start = today + timedelta(days=((7 - today.weekday()) % 7))
+    if args.days is None and args.weeks is None:
+        args.weeks = 1
+
+    os.makedirs(args.out, exist_ok=True)
+
+    with connect_pg(args.dsn) as conn:
+        classes, subjects, teachers, teacher_subjects, merge_groups, availabilities, school_calendar = load_config_from_db(
+            conn, start_date=args.start, days=args.days, weeks=args.weeks
+        )
+        solver = TimetableSolver(
+            classes=classes,
+            subjects=subjects,
+            teachers=teachers,
+            teacher_subjects=teacher_subjects,
+            availability=availabilities,
+            class_plans=_plans_from_db(conn),
+            merge_groups=merge_groups,
+            school_calendar=school_calendar,
+            use_afternoon=args.use_afternoon,
+        )
+        schedule, meta = solver.solve(allow_macro_split_fallback=True, try_split_on_fail=True)
+        if not meta.get("feasible"):
+            print("⚠️ Nessuna soluzione trovata.")
+            print(meta)
+            sys.exit(2)
+
+        csv_path = os.path.join(args.out, "schedule.csv")
+        export_csv(schedule, classes, subjects, teachers, merge_groups, csv_path)
+        export_ics_per_class(schedule, classes, subjects, teachers, merge_groups, os.path.join(args.out, "ics_classi"))
+        export_ics_per_teacher(schedule, teachers, subjects, classes, merge_groups, os.path.join(args.out, "ics_docenti"))
+        print(f"OK. CSV: {csv_path}")
+
+        if args.write_db:
+            write_schedule_to_db(conn, schedule, clear_range=args.clear_range)
+            print("Soluzione scritta su DB (tabella 'schedule').")
 
 if __name__ == "__main__":
-    # Classi
-    classes = {
-        "1B": Class("1B", "1B Sala Bar"),
-        "1C": Class("1C", "1C Cucina"),
-    }
-
-    # Materie
-    subjects = {
-        "ITA": Subject("ITA", "Italiano", block_len_min=1, macro_preferred=False),
-        "MAT": Subject("MAT", "Matematica", block_len_min=1, macro_preferred=False),
-        "CUC": Subject("CUC", "Laboratorio Cucina", block_len_min=2, macro_preferred=True),
-        "SAL": Subject("SAL", "Laboratorio Sala Bar", block_len_min=2, macro_preferred=True),
-    }
-
-    # Docenti
-    teachers = {
-        "ROS": Teacher("ROS", "Rossi"),
-        "BIA": Teacher("BIA", "Bianchi"),
-        "VER": Teacher("VER", "Verdi"),
-        "NER": Teacher("NER", "Neri"),
-    }
-
-    # Abilitazioni docente->materia
-    teacher_subjects = {
-        "ROS": {"ITA", "MAT"},
-        "BIA": {"CUC"},
-        "VER": {"SAL"},
-        "NER": {"MAT"},
-    }
-
-    # Gruppo accorpato per materie di base
-    merge_groups = {
-        "GBC": MergeGroup("GBC", "1B+1C Basi", members=["1B","1C"])
-    }
-
-    # Piani (esempio per una settimana)
-    class_plans = [
-        ClassSubjectPlan("P1", "G:GBC", "ITA", total_hours=3),
-        ClassSubjectPlan("P2", "G:GBC", "MAT", total_hours=3),
-        ClassSubjectPlan("P3", "C:1C", "CUC", total_hours=4),
-        ClassSubjectPlan("P4", "C:1B", "SAL", total_hours=4),
-    ]
-
-    # Calendario: prossima settimana (Lun-Ven) rispetto ad oggi
-    today = date.today()
-    monday = today + timedelta(days=((7 - today.weekday()) % 7))  # prossimo lunedì (o oggi se è lunedì)
-    school_days = [monday + timedelta(days=i) for i in range(5)]  # Lun..Ven
-    school_calendar = SchoolCalendar(school_days=school_days)
-
-    # Disponibilità docenti: tutti 08-13 di default
-    all_morning = set(["08:00","09:00","10:00","11:00","12:00","13:00"])
-    availability = []
-    for tid in teachers.keys():
-        for wd in range(5):  # Lun-Ven
-            availability.append(Availability(tid, wd, set(all_morning)))
-
-    # Qualche vincolo realistico
-    # Bianchi (CUC) non disponibile Mer 10:00
-    for av in availability:
-        if av.teacher_id == "BIA" and av.weekday == 2:
-            av.slot_labels.discard("10:00")
-    # Verdi (SAL) non disponibile Gio 12:00
-    for av in availability:
-        if av.teacher_id == "VER" and av.weekday == 3:
-            av.slot_labels.discard("12:00")
-
-    # Esecuzione solver
-    solver = TimetableSolver(
-        classes=classes,
-        subjects=subjects,
-        teachers=teachers,
-        teacher_subjects=teacher_subjects,
-        availability=availability,
-        class_plans=class_plans,
-        merge_groups=merge_groups,
-        school_calendar=school_calendar,
-        use_afternoon=False,  # metti True per includere 14:30, 15:30
-    )
-
-    schedule, meta = solver.solve(allow_macro_split_fallback=True, try_split_on_fail=True)
-
-    out_folder = "./timetable_demo"
-    os.makedirs(out_folder, exist_ok=True)
-
-    if meta.get("feasible"):
-        csv_path = os.path.join(out_folder, "schedule.csv")
-        export_csv(schedule, classes, subjects, teachers, merge_groups, csv_path)
-        export_ics_per_class(schedule, classes, subjects, teachers, merge_groups, os.path.join(out_folder, "ics_classi"))
-        export_ics_per_teacher(schedule, teachers, subjects, classes, merge_groups, os.path.join(out_folder, "ics_docenti"))
-
-        # Stampa anteprima
-        from collections import defaultdict
-        by_day = defaultdict(list)
-        for a in schedule:
-            by_day[a.date].append(a)
-        print("Orario generato\n")
-        for d in sorted(by_day.keys()):
-            print(f"=== {d.isoformat()} ({weekday_it(d)}) ===")
-            for a in sorted(by_day[d], key=lambda x:(x.start_slot, x.class_or_group_id)):
-                if a.class_or_group_id.startswith("C:"):
-                    cid = a.class_or_group_id.split("C:",1)[1]
-                    entity = classes[cid].name
-                else:
-                    gid = a.class_or_group_id.split("G:",1)[1]
-                    entity = merge_groups[gid].name
-                print(f"{a.start_slot}-{a.end_slot} | {entity:14} | {subjects[a.subject_id].name:20} | {teachers[a.teacher_id].name}")
-        print("\nFile generati:")
-        print(f"- CSV: {csv_path}")
-        print(f"- ICS classi: {os.path.join(out_folder, 'ics_classi')} (uno per classe)")
-        print(f"- ICS docenti: {os.path.join(out_folder, 'ics_docenti')} (uno per docente)")
-    else:
-        print("⚠️ Nessuna soluzione trovata.")
-        print(meta)
+    main()
